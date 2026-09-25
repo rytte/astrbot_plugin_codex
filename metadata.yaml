@@ -1,0 +1,6 @@
+name: astrbot_plugin_codex
+display_name: Codex app-server
+desc: 通过 Codex app-server RPC 在私聊中连续控制 Codex。
+version: 0.1.0
+author: Airi
+astrbot_version: ">=4.27,<5"

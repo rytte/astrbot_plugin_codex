@@ -1,0 +1,14 @@
+{
+  "codex_command": {
+    "description": "Codex CLI 可执行文件或命令名",
+    "type": "string",
+    "default": "codex",
+    "hint": "通常保持 codex 即可；Codex 不在 PATH 时填写 codex.cmd 或 codex 可执行文件的绝对路径。"
+  },
+  "approval_timeout": {
+    "description": "审批等待超时秒数",
+    "type": "int",
+    "default": 180,
+    "hint": "等待 /codex yes 或 /codex no 的时间，允许 30～900 秒。"
+  }
+}
