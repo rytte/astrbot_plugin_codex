@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.star.filter.command import GreedyStr
@@ -46,6 +51,13 @@ class ActiveTurn:
     interrupt_requested: bool = False
     success_message: str | None = None
     task: asyncio.Task | None = None
+    activity_events: list[dict[str, Any]] = field(default_factory=list)
+    active_items: dict[str, str] = field(default_factory=dict)
+    current_activity: str = "等待 Codex 开始"
+    started_at: float = field(default_factory=monotonic)
+    report_task: asyncio.Task | None = None
+    report_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    report_error_notified: bool = False
 
 
 @dataclass
@@ -423,9 +435,20 @@ class CodexPlugin(Star):
                     raise CodexAppServerError("请先发送 /codex 开启 Codex 连续对话。")
                 state = self.active_turns.get(binding.thread_id)
                 running = bool(state and not state.completed.done())
+                activity = (
+                    list(state.active_items.values())[-1]
+                    if state and state.active_items
+                    else state.current_activity
+                    if state
+                    else "无运行中的任务"
+                )
+                event_count = len(state.activity_events) if state else 0
                 result = (
                     f"模式：{'连续对话' if binding.enabled else '已切出'}\n"
                     f"任务：{'运行中' if running else '空闲'}\n"
+                    f"当前活动：{activity}\n"
+                    f"中间事件：{event_count} 条\n"
+                    f"模型：{self._model_description(binding)}\n"
                     f"工作目录：{binding.cwd}\n线程：{binding.thread_id}"
                 )
             elif action == "pwd":
@@ -527,6 +550,25 @@ class CodexPlugin(Star):
                             f"当前线程的思考等级已设为 "
                             f"{self._model_description(binding)}。"
                         )
+            elif action == "summary":
+                binding = await self._require_binding(event)
+                requested_summary = argument.lower().strip()
+                choices = {"none", "auto", "concise", "detailed"}
+                if requested_summary not in choices:
+                    raise CodexAppServerError(
+                        "summary 用法：/codex summary <none|auto|concise|detailed>。"
+                    )
+                async with binding.lock:
+                    self._ensure_idle(binding)
+                    client = await self._ensure_client()
+                    await client.request(
+                        "thread/settings/update",
+                        {
+                            "threadId": binding.thread_id,
+                            "summary": requested_summary,
+                        },
+                    )
+                result = f"当前线程的推理摘要级别已设为 {requested_summary}。"
             elif action == "compact":
                 binding = await self._require_binding(event)
                 async with binding.lock:
@@ -556,7 +598,7 @@ class CodexPlugin(Star):
             else:
                 result = (
                     f"暂不支持 Codex 命令 /{action}。可用命令："
-                    "exit、close、yes、no、stop、status、pwd、new、compact、review、model、effort。"
+                    "help、exit、close、yes、no、stop、status、pwd、new、compact、review、model、effort、summary。"
                     "要把斜杠文本作为普通任务，请在消息开头加 //。"
                 )
         except (CodexAppServerError, OSError, ValueError) as exc:
@@ -647,6 +689,7 @@ class CodexPlugin(Star):
         self.active_turns[binding.thread_id] = state
         task = self._track_task(self._run_turn(binding, state, method, params))
         state.task = task
+        state.report_task = self._track_task(self._periodic_activity_reports(state))
         return state
 
     def _track_task(self, coroutine) -> asyncio.Task:
@@ -691,23 +734,414 @@ class CodexPlugin(Star):
                     error.get("message") if isinstance(error, dict) else str(error)
                 )
                 message = f"Codex 任务失败：{error_text}"
+                report_status = "失败"
             elif status == "completed" and state.success_message:
                 message = state.success_message
+                report_status = "已完成"
             elif status == "interrupted" and not message:
                 message = "Codex 任务已中断。"
+                report_status = "已中断"
             elif status == "failed" and not message:
                 message = "Codex 任务失败，请查看 AstrBot 日志。"
+                report_status = "失败"
+            else:
+                report_status = "已完成" if status == "completed" else "已结束"
             if not message:
                 message = "Codex 已完成任务，但没有返回文本。"
+            state.current_activity = report_status
+            await self._send_activity_report(
+                state, status=report_status, final=True
+            )
             await self._send_codex_reply(state.event, message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if not state.suppress_reply:
+                state.current_activity = "失败"
+                await self._send_activity_report(
+                    state, status="失败", error=str(exc), final=True
+                )
                 await self._send_codex_reply(state.event, f"Codex 任务失败：{exc}")
         finally:
+            if state.report_task and not state.report_task.done():
+                state.report_task.cancel()
+                await asyncio.gather(state.report_task, return_exceptions=True)
             if self.active_turns.get(state.thread_id) is state:
                 self.active_turns.pop(state.thread_id, None)
+
+    async def _periodic_activity_reports(self, state: ActiveTurn) -> None:
+        while not state.completed.done() and not state.suppress_reply:
+            try:
+                await asyncio.wait_for(asyncio.shield(state.completed), timeout=60)
+            except asyncio.TimeoutError:
+                if state.completed.done() or state.suppress_reply:
+                    return
+                status = (
+                    "等待审批"
+                    if any(
+                        approval.umo == state.binding.umo
+                        for approval in self.pending_approvals.values()
+                    )
+                    else "工作中"
+                )
+                await self._send_activity_report(state, status=status)
+            else:
+                return
+
+    def _get_browser_service(self):
+        metadata = self.context.get_registered_star("astrbot_plugin_browser")
+        if (
+            metadata is None
+            or not metadata.activated
+            or metadata.star_cls is None
+        ):
+            raise CodexAppServerError("请先启用 astrbot_plugin_browser 插件。")
+        service = metadata.star_cls.service
+        if not service.ready:
+            raise CodexAppServerError("astrbot_plugin_browser 服务尚未就绪。")
+        return service
+
+    @staticmethod
+    def _activity_title(method: str, params: dict[str, Any]) -> str:
+        item = params.get("item")
+        if isinstance(item, dict):
+            kind = item.get("type")
+            if kind == "commandExecution":
+                command = str(item.get("command") or "命令执行")
+                return "执行命令：" + command.replace("\n", " ")[:180]
+            if kind == "mcpToolCall":
+                return f"MCP 工具：{item.get('server', '?')}/{item.get('tool', '?')}"
+            if kind == "fileChange":
+                return f"文件变更：{len(item.get('changes', []))} 项"
+            if kind == "agentMessage":
+                return "生成 Codex 回复"
+            if kind == "reasoning":
+                return "推理摘要"
+            if kind == "plan":
+                return "更新执行计划"
+            return f"Codex 活动：{kind or '未知项目'}"
+        if method == "item/commandExecution/outputDelta":
+            return "命令输出"
+        if method == "item/mcpToolCall/progress":
+            message = str(params.get("message") or "MCP 工具处理中")
+            return "MCP 工具进度：" + message[:160]
+        if method.startswith("serverRequest/"):
+            request_method = method.removeprefix("serverRequest/")
+            if request_method == "item/commandExecution/requestApproval":
+                return "等待命令执行审批"
+            if request_method == "item/fileChange/requestApproval":
+                return "等待文件修改审批"
+            if request_method == "item/permissions/requestApproval":
+                return "处理额外权限请求"
+            if request_method == "resolved":
+                decision = str(params.get("decision") or "已处理")
+                return "审批结果：" + decision
+            return "权限审批：" + request_method
+        if method == "item/agentMessage/delta":
+            return "生成回复内容"
+        if method.startswith("item/reasoning/"):
+            return "推理摘要更新"
+        if method.startswith("turn/"):
+            return "Codex 任务状态：" + method.removeprefix("turn/")
+        return method
+
+    def _record_activity(
+        self, state: ActiveTurn, method: str, params: dict[str, Any]
+    ) -> None:
+        snapshot = json.loads(json.dumps(params, ensure_ascii=False, default=str))
+        item = snapshot.get("item")
+        item_id = (
+            item.get("id")
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+            else snapshot.get("itemId")
+        )
+        event = {
+            "sequence": len(state.activity_events) + 1,
+            "time": datetime.now().astimezone().strftime("%H:%M:%S"),
+            "method": method,
+            "item_id": item_id if isinstance(item_id, str) else None,
+            "title": self._activity_title(method, snapshot),
+            "params": snapshot,
+        }
+        state.activity_events.append(event)
+
+    @staticmethod
+    def _notification_turn_id(method: str, params: dict[str, Any]) -> str | None:
+        if method in {"turn/started", "turn/completed"}:
+            turn = params.get("turn")
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+                return turn["id"]
+            return None
+        turn_id = params.get("turnId")
+        return turn_id if isinstance(turn_id, str) else None
+
+    def _activity_for_item(
+        self, state: ActiveTurn, method: str, params: dict[str, Any]
+    ) -> None:
+        item = params.get("item")
+        item_id = None
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            item_id = item["id"]
+        if not item_id and isinstance(params.get("itemId"), str):
+            item_id = params["itemId"]
+        if method == "item/started" and item_id:
+            state.active_items[item_id] = self._activity_title(method, params)
+        elif method == "item/completed" and item_id:
+            state.active_items.pop(item_id, None)
+        if method == "turn/started":
+            state.current_activity = "Codex 任务已开始"
+        elif method == "turn/completed":
+            state.current_activity = "Codex 任务已完成"
+        elif method == "item/completed":
+            state.current_activity = "等待 Codex 继续工作"
+        elif method == "item/reasoning/summaryTextDelta":
+            delta = params.get("delta")
+            if isinstance(delta, str) and delta.strip():
+                state.current_activity = "推理摘要：" + " ".join(delta.split())[:160]
+            else:
+                state.current_activity = "推理摘要更新"
+        else:
+            state.current_activity = self._activity_title(method, params)
+
+    @staticmethod
+    def _activity_preview(events: list[dict[str, Any]], limit: int = 420) -> str:
+        """Extract human-readable streaming text without replacing raw events."""
+        chunks: list[str] = []
+        seen: set[str] = set()
+        for event in events:
+            method = event.get("method")
+            params = event.get("params")
+            if not isinstance(params, dict):
+                continue
+            text: str | None = None
+            if method in {
+                "item/reasoning/summaryTextDelta",
+                "item/plan/delta",
+                "item/commandExecution/outputDelta",
+                "item/fileChange/outputDelta",
+            }:
+                value = params.get("delta")
+                if isinstance(value, str):
+                    text = value
+            elif method == "item/mcpToolCall/progress":
+                value = params.get("message")
+                if isinstance(value, str):
+                    text = value
+            elif method in {"item/started", "item/completed"}:
+                item = params.get("item")
+                if isinstance(item, dict):
+                    if item.get("type") == "reasoning":
+                        summary = item.get("summary")
+                        if isinstance(summary, list):
+                            value = "\n".join(
+                                part for part in summary if isinstance(part, str)
+                            )
+                            if value:
+                                text = value
+                    elif item.get("type") == "plan":
+                        value = item.get("text")
+                        if isinstance(value, str):
+                            text = value
+            if not text or not text.strip():
+                continue
+            text = text.strip()
+            if text in seen:
+                continue
+            seen.add(text)
+            chunks.append(text)
+        preview = "\n".join(chunks)
+        if len(preview) > limit:
+            return preview[: max(0, limit - 1)].rstrip() + "…"
+        return preview
+
+    @staticmethod
+    def _activity_groups(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups: dict[str, dict[str, Any]] = {}
+        for event in events:
+            item_id = event.get("item_id")
+            key = f"item:{item_id}" if item_id else f"method:{event['method']}"
+            group = groups.get(key)
+            if group is None:
+                group = {
+                    "title": event.get("title", event["method"]),
+                    "first_time": event.get("time", ""),
+                    "last_time": event.get("time", ""),
+                    "events": [],
+                }
+                groups[key] = group
+            elif event["method"] in {"item/started", "item/completed"}:
+                group["title"] = event.get("title", group["title"])
+            group["last_time"] = event.get("time", group["last_time"])
+            group["events"].append(event)
+        return list(groups.values())
+
+    def _activity_report_html(
+        self,
+        state: ActiveTurn,
+        *,
+        status: str,
+        full: bool,
+        error: str | None = None,
+    ) -> str:
+        groups = self._activity_groups(state.activity_events)
+        visible_groups = groups if full else groups[-24:]
+        elapsed = max(0, int(monotonic() - state.started_at))
+        current = state.current_activity
+        if state.active_items:
+            current = list(state.active_items.values())[-1]
+
+        cards = []
+        for group in visible_groups:
+            serialized = json.dumps(group["events"], ensure_ascii=False, indent=2)
+            line_count = len(serialized.splitlines())
+            title = html.escape(str(group["title"]))
+            preview = html.escape(self._activity_preview(group["events"]))
+            preview_block = (
+                f"<div class='preview'>{preview}</div>" if preview else ""
+            )
+            if not preview and "推理摘要" in str(group["title"]):
+                preview_block = (
+                    "<div class='preview muted'>"
+                    "未收到摘要文本；原始事件仍已记录"
+                    "</div>"
+                )
+            time_label = html.escape(
+                str(group["first_time"])
+                if group["first_time"] == group["last_time"]
+                else f"{group['first_time']} - {group['last_time']}"
+            )
+            count = len(group["events"])
+            if full:
+                cards.append(
+                    "<details class='activity'><summary>"
+                    f"<span>{title}</span><small>{time_label} · {count} 条 · 原始 +{line_count} 行</small>"
+                    f"</summary>{preview_block}<pre>"
+                    f"{html.escape(serialized)}"
+                    "</pre></details>"
+                )
+            else:
+                cards.append(
+                    "<div class='activity'><div class='activity-body'><div><span>"
+                    f"{title}</span><small>{time_label} · 原始 +{line_count} 行</small></div>"
+                    f"{preview_block}</div></div>"
+                )
+        if not cards:
+            cards.append("<div class='empty'>等待 Codex 活动</div>")
+
+        error_block = (
+            f"<p class='error'>{html.escape(error)}</p>" if error else ""
+        )
+        hidden_count = max(0, len(groups) - len(visible_groups))
+        note = (
+            f"概览只显示最近 24 项；另有 {hidden_count} 项收录在完整记录中。"
+            if hidden_count and not full
+            else "原始通知按活动折叠，可展开查看完整参数与输出。"
+            if full
+            else ""
+        )
+        return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><style>
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; padding: 28px; background: #f4f6f8; color: #17212b; font: 15px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif; }}
+main {{ width: 100%; max-width: 1000px; margin: 0 auto; }}
+header {{ padding: 22px 24px; background: #fff; border: 1px solid #d9e0e5; border-left: 5px solid #138a72; }}
+h1 {{ margin: 0 0 12px; font-size: 23px; }}
+.meta {{ display: flex; flex-wrap: wrap; gap: 8px 22px; color: #53616c; }}
+.current {{ margin-top: 13px; padding-top: 12px; border-top: 1px solid #e5e9ec; }}
+section {{ margin-top: 14px; padding: 18px 22px; background: #fff; border: 1px solid #d9e0e5; }}
+h2 {{ margin: 0 0 12px; font-size: 17px; }}
+.activity {{ display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-top: 1px solid #edf0f2; overflow-wrap: anywhere; }}
+.activity-body {{ width: 100%; min-width: 0; }}
+.activity-body > div:first-child {{ display: flex; justify-content: space-between; gap: 16px; }}
+details.activity {{ display: block; }}
+summary {{ display: flex; justify-content: space-between; gap: 16px; cursor: pointer; }}
+small {{ flex: 0 0 auto; color: #697681; }}
+.preview {{ margin-top: 6px; color: #344652; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }}
+pre {{ max-height: none; margin: 10px 0 4px; padding: 12px; background: #f4f6f8; border: 1px solid #e2e7ea; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 Consolas, monospace; }}
+.empty,.note,.muted {{ color: #697681; }}
+.note {{ margin: 12px 0 0; font-size: 12px; }}
+.error {{ color: #a72e2e; }}
+</style></head><body><main>
+<header><h1>Codex 执行情况</h1><div class="meta">
+<span>状态：{html.escape(status)}</span><span>耗时：{elapsed // 60} 分 {elapsed % 60} 秒</span>
+<span>模型：{html.escape(self._model_description(state.binding))}</span>
+<span>事件：{len(state.activity_events)}</span>
+</div><div class="current">当前活动：{html.escape(current)}</div>{error_block}</header>
+<section><h2>活动记录</h2>{''.join(cards)}<p class="note">{html.escape(note)}</p></section>
+</main></body></html>"""
+
+    async def _send_activity_report(
+        self,
+        state: ActiveTurn,
+        *,
+        status: str,
+        final: bool = False,
+        error: str | None = None,
+    ) -> None:
+        if state.suppress_reply:
+            return
+        async with state.report_lock:
+            if state.suppress_reply:
+                return
+            report_file: Path | None = None
+            if final:
+                report_dir = self.data_dir / "reports"
+                report_dir.mkdir(parents=True, exist_ok=True)
+                report_file = report_dir / (
+                    f"codex-{state.thread_id[:8]}-{uuid4().hex[:8]}.html"
+                )
+                full_html = self._activity_report_html(
+                    state, status=status, full=True, error=error
+                )
+                await asyncio.to_thread(
+                    report_file.write_text, full_html, encoding="utf-8"
+                )
+
+            try:
+                service = self._get_browser_service()
+                overview_html = self._activity_report_html(
+                    state, status=status, full=False, error=error
+                )
+                png = await service.render_html(
+                    overview_html,
+                    viewport={"width": 1000, "height": 900},
+                    full_page=True,
+                    timeout=30,
+                    max_pixels=8_000_000,
+                )
+                if state.suppress_reply:
+                    return
+                caption = (
+                    f"[codex] 执行情况：{status}，已收集 "
+                    f"{len(state.activity_events)} 条中间事件。"
+                )
+                await state.event.send(
+                    MessageChain(chain=[Plain(caption), Image.fromBytes(png)])
+                )
+            except Exception as exc:
+                self.logger.warning("无法生成 Codex 执行情况图片：%s", exc)
+                if not state.report_error_notified and not final:
+                    state.report_error_notified = True
+                    await self._send_text(
+                        state.event,
+                        f"[codex] 执行情况图片生成失败：{exc}",
+                    )
+
+            if final and report_file and report_file.is_file():
+                try:
+                    await state.event.send(
+                        MessageChain(
+                            chain=[
+                                Plain("[codex] 完整执行记录（HTML，可展开查看）"),
+                                File(
+                                    name=report_file.name,
+                                    file=str(report_file),
+                                ),
+                            ]
+                        )
+                    )
+                except Exception as exc:
+                    self.logger.warning("无法发送 Codex HTML 执行记录：%s", exc)
 
     @staticmethod
     def _final_text(outcome: Any) -> str:
@@ -792,6 +1226,23 @@ class CodexPlugin(Star):
     ) -> None:
         if self.pending_approvals.pop(approval.request_id, None) is None:
             return
+        binding = self.bindings.get(approval.umo)
+        state = self.active_turns.get(binding.thread_id) if binding else None
+        if state:
+            decision = "超时拒绝" if expired else ("已批准" if approve else "已拒绝")
+            activity_params = dict(approval.details)
+            activity_params.update(
+                {
+                    "requestId": approval.request_id,
+                    "method": approval.method,
+                    "decision": decision,
+                }
+            )
+            self._record_activity(
+                state, "serverRequest/resolved", activity_params
+            )
+            state.active_items.pop(f"approval:{approval.request_id}", None)
+            state.current_activity = f"审批{decision}"
         current_task = asyncio.current_task()
         if approval.timer and approval.timer is not current_task:
             approval.timer.cancel()
@@ -882,6 +1333,7 @@ class CodexPlugin(Star):
     def _help_text() -> str:
         return (
             "/codex：开启或恢复连续对话\n"
+            "/codex help：显示此帮助\n"
             "/codex exit：切出并保留线程\n"
             "/codex close：关闭绑定并中断任务\n"
             "/codex stop：中断当前任务\n"
@@ -891,6 +1343,7 @@ class CodexPlugin(Star):
             "/codex review [uncommitted|base <分支>|commit <SHA>]：代码审查\n"
             "/codex model [模型ID [思考等级]]：列出或切换模型\n"
             "/codex effort [思考等级]：查看或切换当前模型的思考等级\n"
+            "/codex summary <none|auto|concise|detailed>：切换推理摘要级别\n"
             "/codex yes、/codex no：处理审批\n"
             "普通斜杠文本前加 // 可作为 Codex 任务发送。"
         )
@@ -902,6 +1355,18 @@ class CodexPlugin(Star):
         state = self.active_turns.get(thread_id)
         if state is None:
             return
+        notification_turn_id = self._notification_turn_id(method, params)
+        if (
+            notification_turn_id
+            and state.turn_id
+            and notification_turn_id != state.turn_id
+        ):
+            return
+        if notification_turn_id and state.turn_id is None:
+            state.turn_id = notification_turn_id
+            state.turn_started.set()
+        self._record_activity(state, method, params)
+        self._activity_for_item(state, method, params)
         if method == "turn/started":
             turn = params.get("turn", {})
             turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -965,6 +1430,18 @@ class CodexPlugin(Star):
             )
             self.pending_approvals[request_id] = approval
             approval.timer = asyncio.create_task(self._expire_approval(request_id))
+            if state:
+                activity_params = dict(params)
+                activity_params["requestId"] = request_id
+                self._record_activity(
+                    state, f"serverRequest/{method}", activity_params
+                )
+                state.active_items[f"approval:{request_id}"] = (
+                    "等待命令执行审批"
+                    if method == "item/commandExecution/requestApproval"
+                    else "等待文件修改审批"
+                )
+                state.current_activity = state.active_items[f"approval:{request_id}"]
             if method == "item/commandExecution/requestApproval":
                 command = str(params.get("command") or "(命令详情不可用)")[:1200]
                 detail = f"Codex 请求执行命令：\n{command}"
@@ -985,12 +1462,31 @@ class CodexPlugin(Star):
             if binding:
                 state = self.active_turns.get(binding.thread_id)
                 if state:
+                    activity_params = dict(params)
+                    activity_params.update(
+                        {"requestId": request_id, "decision": "decline"}
+                    )
+                    self._record_activity(
+                        state, f"serverRequest/{method}", activity_params
+                    )
+                    state.current_activity = "额外权限请求已拒绝"
                     await self._send_text(
                         state.event,
                         "Codex 请求额外权限；当前插件不提供粒度授权，本次未授予额外权限。",
                     )
             return
 
+        if binding:
+            state = self.active_turns.get(binding.thread_id)
+            if state:
+                activity_params = dict(params)
+                activity_params["requestId"] = request_id
+                self._record_activity(
+                    state, f"serverRequest/{method}", activity_params
+                )
+                state.current_activity = self._activity_title(
+                    f"serverRequest/{method}", activity_params
+                )
         if self.client:
             await self.client.reject_server_request(
                 request_id, f"AstrBot Codex 插件不支持客户端请求：{method}"
