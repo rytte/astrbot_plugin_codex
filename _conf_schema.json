@@ -11,6 +11,12 @@
     "default": 180,
     "hint": "等待 /codex yes 或 /codex no 的时间，允许 30～900 秒。"
   },
+  "send_progress_images": {
+    "description": "执行过程中发送 HTML 渲染图片",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭；开启后，每累计 3 条主要活动发送一张图片，Codex 回复前会先发送不足 3 条的剩余活动。"
+  },
   "send_final_report": {
     "description": "任务结束时发送 HTML 执行报告",
     "type": "bool",

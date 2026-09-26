@@ -6,12 +6,15 @@ import asyncio
 import html
 import json
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
 from time import monotonic
 from typing import Any, Iterable
 from uuid import uuid4
+
+from PIL import Image, ImageChops
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
@@ -73,6 +76,8 @@ class ActiveTurn:
     )
     activity_truncated: bool = False
     had_reportable_activity: bool = False
+    progress_seen_keys: set[str] = field(default_factory=set)
+    progress_pending_groups: list[dict[str, Any]] = field(default_factory=list)
     active_items: dict[str, str] = field(default_factory=dict)
     current_activity: str = "等待 Codex 开始"
     started_at: float = field(default_factory=monotonic)
@@ -119,6 +124,7 @@ class CodexPlugin(Star):
         unknown = set(settings) - {
             "codex_command",
             "approval_timeout",
+            "send_progress_images",
             "send_final_report",
             "allow_group_chat",
         }
@@ -126,6 +132,7 @@ class CodexPlugin(Star):
             raise ValueError("未知插件配置：" + ", ".join(sorted(unknown)))
         self.codex_command = str(settings.get("codex_command", "codex")).strip()
         self.approval_timeout = settings.get("approval_timeout", 180)
+        self.send_progress_images = settings.get("send_progress_images", False)
         self.send_final_report = settings.get("send_final_report", False)
         self.allow_group_chat = settings.get("allow_group_chat", False)
         if (
@@ -133,6 +140,8 @@ class CodexPlugin(Star):
             or not 30 <= self.approval_timeout <= 900
         ):
             raise ValueError("approval_timeout 必须是 30～900 之间的整数。")
+        if type(self.send_progress_images) is not bool:
+            raise ValueError("send_progress_images 必须是布尔值。")
         if type(self.send_final_report) is not bool:
             raise ValueError("send_final_report 必须是布尔值。")
         if type(self.allow_group_chat) is not bool:
@@ -525,7 +534,7 @@ class CodexPlugin(Star):
                 )
                 activity_count = (
                     f"{len(self._activity_groups(state.activity_events))} 项"
-                    if state and self.send_final_report
+                    if state and (self.send_progress_images or self.send_final_report)
                     else "未收集（报告已关闭）"
                     if state
                     else "0 项"
@@ -820,6 +829,7 @@ class CodexPlugin(Star):
             outcome = await state.completed
             if state.suppress_reply:
                 return
+            self._flush_progress_images(state)
             if state.delivery_task:
                 await asyncio.gather(state.delivery_task, return_exceptions=True)
             for reply in self._remaining_reply_texts(state, outcome):
@@ -858,6 +868,9 @@ class CodexPlugin(Star):
         except Exception as exc:
             if not state.suppress_reply:
                 state.current_activity = "失败"
+                self._flush_progress_images(state)
+                if state.delivery_task:
+                    await asyncio.gather(state.delivery_task, return_exceptions=True)
                 await self._send_codex_reply(state.event, f"Codex 任务失败：{exc}")
                 if self.send_final_report:
                     await self._send_final_activity_report(
@@ -881,6 +894,87 @@ class CodexPlugin(Star):
         state.delivery_task = self._track_task(deliver())
         state.reply_sent = True
         state.sent_message_texts.add(message)
+
+    @staticmethod
+    def _is_progress_group(group: dict[str, Any]) -> bool:
+        return group["kind"] not in {None, "agentMessage", "userMessage"} or any(
+            event["method"].startswith("serverRequest/") for event in group["events"]
+        )
+
+    def _queue_progress_image(self, state: ActiveTurn, *, count: int = 3) -> None:
+        groups = state.progress_pending_groups[:count]
+        if not groups:
+            return
+        del state.progress_pending_groups[:count]
+        report_html = self._activity_report_html(
+            state,
+            status="",
+            full=True,
+            activity_groups=groups,
+            image_only=True,
+        )
+        previous = state.delivery_task
+
+        async def deliver() -> None:
+            if previous:
+                await asyncio.gather(previous, return_exceptions=True)
+            if state.suppress_reply:
+                return
+            try:
+                image_path = await asyncio.wait_for(
+                    self.html_render(
+                        "{{ report_html | safe }}",
+                        {"report_html": report_html},
+                        return_url=False,
+                        options={"full_page": True, "type": "png"},
+                    ),
+                    timeout=30,
+                )
+                self._crop_progress_image(image_path)
+                if not state.suppress_reply:
+                    await state.event.send(MessageChain().file_image(image_path))
+            except Exception:
+                self.logger.exception("无法发送 Codex 执行过程图片")
+
+        state.delivery_task = self._track_task(deliver())
+
+    @staticmethod
+    def _crop_progress_image(image_path: str) -> None:
+        with Image.open(image_path) as rendered:
+            image = rendered.convert("RGB")
+        background = Image.new("RGB", image.size, image.getpixel((0, 0)))
+        bounds = ImageChops.difference(image, background).getbbox()
+        if bounds:
+            image.crop(bounds).save(image_path, format="PNG")
+
+    def _add_progress_group(self, state: ActiveTurn, group: dict[str, Any]) -> None:
+        if (
+            not self._is_progress_group(group)
+            or group["key"] in state.progress_seen_keys
+        ):
+            return
+        state.progress_seen_keys.add(group["key"])
+        state.progress_pending_groups.append(deepcopy(group))
+        if len(state.progress_pending_groups) == 3:
+            self._queue_progress_image(state)
+
+    def _progress_record_completed(self, state: ActiveTurn, key: str) -> None:
+        if not self.send_progress_images or state.suppress_reply:
+            return
+        for group in self._activity_groups(state.activity_events):
+            if group["key"] == key:
+                self._add_progress_group(state, group)
+                break
+
+    def _flush_progress_images(self, state: ActiveTurn) -> None:
+        if not self.send_progress_images or state.suppress_reply:
+            return
+        for group in self._activity_groups(state.activity_events):
+            self._add_progress_group(state, group)
+        while state.progress_pending_groups:
+            self._queue_progress_image(
+                state, count=min(3, len(state.progress_pending_groups))
+            )
 
     @staticmethod
     def _remaining_reply_texts(state: ActiveTurn, outcome: Any) -> list[str]:
@@ -1015,7 +1109,10 @@ class CodexPlugin(Star):
     def _record_activity(
         self, state: ActiveTurn, method: str, params: dict[str, Any]
     ) -> None:
-        if not self.send_final_report or method in self._HIDDEN_ACTIVITY_METHODS:
+        if (
+            not (self.send_progress_images or self.send_final_report)
+            or method in self._HIDDEN_ACTIVITY_METHODS
+        ):
             return
         raw_item = params.get("item")
         if isinstance(raw_item, dict) and raw_item.get("type") == "userMessage":
@@ -1041,6 +1138,11 @@ class CodexPlugin(Star):
             if isinstance(item, dict) and isinstance(item.get("id"), str)
             else snapshot.get("itemId")
         )
+        if (
+            method.startswith("serverRequest/")
+            and snapshot.get("requestId") is not None
+        ):
+            item_id = f"approval:{snapshot['requestId']}"
         item_id = item_id if isinstance(item_id, str) else None
         if method in self._COALESCED_ACTIVITY_METHODS and state.activity_events:
             previous = state.activity_events[-1]
@@ -1203,6 +1305,7 @@ class CodexPlugin(Star):
             group = groups.get(key)
             if group is None:
                 group = {
+                    "key": key,
                     "title": event.get("title", event["method"]),
                     "first_time": event.get("time", ""),
                     "last_time": event.get("time", ""),
@@ -1477,8 +1580,8 @@ class CodexPlugin(Star):
     def _result_excerpt(value: str, limit: int = _REPORT_RESULT_PREVIEW_LIMIT) -> str:
         if len(value) <= limit:
             return value
-        head = value[:200].rstrip()
-        tail = value[-200:].lstrip()
+        head = value[:200]
+        tail = value[-200:]
         return f"{head}\n…（中间内容已折叠）…\n{tail}"
 
     @staticmethod
@@ -1514,12 +1617,20 @@ class CodexPlugin(Star):
         status: str,
         full: bool,
         error: str | None = None,
+        activity_groups: list[dict[str, Any]] | None = None,
+        image_only: bool = False,
     ) -> str:
-        groups = self._activity_groups(state.activity_events)
+        groups = (
+            activity_groups
+            if activity_groups is not None
+            else self._activity_groups(state.activity_events)
+        )
         visible_groups = groups if full else groups[-24:]
 
         cards = []
         for group in visible_groups:
+            if image_only and not self._is_progress_group(group):
+                continue
             kind = group["kind"]
             if kind == "agentMessage":
                 style_kind, result_label = "reply", ""
@@ -1552,9 +1663,12 @@ class CodexPlugin(Star):
             if kind == "commandExecution":
                 command = self._activity_item(group["events"]).get("command")
                 if isinstance(command, str) and command.strip():
+                    command = self._display_command(command)
+                    if image_only:
+                        command = self._result_excerpt(command)
                     command_block = (
                         "<div class='command'><span class='field-label'>命令</span>"
-                        f"<code>{html.escape(self._display_command(command))}</code></div>"
+                        f"<code>{html.escape(command)}</code></div>"
                     )
             if kind == "agentMessage":
                 status_text, result_text, highlight = (
@@ -1580,7 +1694,9 @@ class CodexPlugin(Star):
                 else ""
             )
             preview = (
-                highlight
+                self._result_excerpt(result_text)
+                if image_only
+                else highlight
                 if highlight and len(result_text) > _REPORT_RESULT_PREVIEW_LIMIT
                 else self._result_excerpt(result_text)
             )
@@ -1599,7 +1715,9 @@ class CodexPlugin(Star):
             detail_block = (
                 "<details class='result-detail'><summary>查看完整结果</summary>"
                 f"<pre>{html.escape(result_text)}</pre></details>"
-                if result_text and len(result_text) > _REPORT_RESULT_PREVIEW_LIMIT
+                if not image_only
+                and result_text
+                and len(result_text) > _REPORT_RESULT_PREVIEW_LIMIT
                 else ""
             )
             cards.append(
@@ -1635,6 +1753,19 @@ class CodexPlugin(Star):
         )
         if state.activity_truncated:
             note += " 较早活动或过长内容已截断。"
+        body = (
+            f"<section class='progress'>{''.join(cards)}</section>"
+            if image_only
+            else (
+                f'<header class="{outcome_style}"><h1>Codex 执行记录</h1>'
+                f'<div class="meta"><span>本轮结果：{html.escape(status)}</span>'
+                f'<span>耗时：{self._elapsed_text(state.started_at)}</span>'
+                f'<span>模型：{html.escape(self._model_description(state.binding))}</span>'
+                f'<span>活动：{len(groups)} 项</span></div>{error_block}</header>'
+                f'{request_block}<section><h2>活动记录</h2>{"".join(cards)}'
+                f'<p class="note">{html.escape(note)}</p></section>'
+            )
+        )
         return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><style>
 * {{ box-sizing: border-box; }}
@@ -1646,6 +1777,7 @@ header.outcome-error {{ border-left-color: #b9574b; }}
 h1 {{ margin: 0 0 12px; font-size: 23px; }}
 .meta {{ display: flex; flex-wrap: wrap; gap: 8px 22px; color: #53616c; }}
 section {{ margin-top: 14px; padding: 18px 22px; background: #fff; border: 1px solid #d9e0e5; }}
+section.progress {{ margin-top: 0; }}
 h2 {{ margin: 0 0 12px; font-size: 17px; }}
 .request-text {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
 .activity {{ --accent: #82909b; --soft: #f8fafb; margin-top: 10px; padding: 14px 16px; border: 1px solid #e0e7eb; border-left: 4px solid var(--accent); border-radius: 8px; background: var(--soft); overflow-wrap: anywhere; }}
@@ -1677,14 +1809,7 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
 .note {{ margin: 12px 0 0; font-size: 12px; }}
 .error {{ color: #a72e2e; }}
 @media (max-width: 640px) {{ body {{ padding: 12px; }} header,section {{ padding: 16px; }} .activity-head {{ display: block; }} .activity-head small {{ display: block; margin-top: 2px; }} }}
-</style></head><body><main>
-<header class="{outcome_style}"><h1>Codex 执行记录</h1><div class="meta">
-<span>本轮结果：{html.escape(status)}</span><span>耗时：{self._elapsed_text(state.started_at)}</span>
-<span>模型：{html.escape(self._model_description(state.binding))}</span>
-<span>活动：{len(groups)} 项</span>
-</div>{error_block}</header>
-{request_block}<section><h2>活动记录</h2>{''.join(cards)}<p class="note">{html.escape(note)}</p></section>
-</main></body></html>"""
+</style></head><body><main>{body}</main></body></html>"""
 
     async def _send_final_activity_report(
         self,
@@ -1800,6 +1925,9 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
                 }
             )
             self._record_activity(state, "serverRequest/resolved", activity_params)
+            self._progress_record_completed(
+                state, f"item:approval:{approval.request_id}"
+            )
             state.active_items.pop(f"approval:{approval.request_id}", None)
             state.current_activity = f"审批{decision}"
         current_task = asyncio.current_task()
@@ -1962,7 +2090,10 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
                         state.message_deltas.pop(item_id, None)
                     else:
                         state.unassigned_deltas.clear()
+                    self._flush_progress_images(state)
                     self._queue_codex_reply(state, completed_text)
+            elif isinstance(item, dict) and isinstance(item.get("id"), str):
+                self._progress_record_completed(state, f"item:{item['id']}")
         elif method == "turn/completed":
             turn = params.get("turn", {})
             turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -2049,6 +2180,9 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
                     self._record_activity(
                         state, f"serverRequest/{method}", activity_params
                     )
+                    self._progress_record_completed(
+                        state, f"item:approval:{request_id}"
+                    )
                     state.current_activity = "额外权限请求已拒绝"
                     await self._send_text(
                         state.event,
@@ -2062,6 +2196,7 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
                 activity_params = dict(params)
                 activity_params["requestId"] = request_id
                 self._record_activity(state, f"serverRequest/{method}", activity_params)
+                self._progress_record_completed(state, f"item:approval:{request_id}")
                 state.current_activity = self._activity_title(
                     f"serverRequest/{method}", activity_params
                 )
