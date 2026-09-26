@@ -10,5 +10,17 @@
     "type": "int",
     "default": 180,
     "hint": "等待 /codex yes 或 /codex no 的时间，允许 30～900 秒。"
+  },
+  "send_final_report": {
+    "description": "任务结束时发送 HTML 执行报告",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭；开启后，含工具操作的任务或失败任务结束时会生成并发送 HTML 报告。"
+  },
+  "allow_group_chat": {
+    "description": "允许管理员在群聊中连接 Codex",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭；开启后，同一群的 AstrBot 管理员共用 Codex 线程，普通成员的消息不会发送给 Codex。"
   }
 }
