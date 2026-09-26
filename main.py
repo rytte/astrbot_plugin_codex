@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from time import monotonic
-from typing import Any
+from typing import Any, Iterable
 from uuid import uuid4
 
 from astrbot.api import AstrBotConfig
@@ -22,6 +23,15 @@ from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.workspace import resolve_workspace_root_for_umo
 
 from .app_server import AppServerClient, CodexAppServerError
+
+
+_REPORT_EVENT_LIMIT = 500
+_REPORT_EVENT_TEXT_LIMIT = 32_000
+_REPORT_FIELD_TEXT_LIMIT = 16_000
+_REPORT_CONTAINER_LIMIT = 100
+_REPORT_NODE_LIMIT = 1_000
+_REPORT_RESULT_PREVIEW_LIMIT = 800
+_REPORT_TRUNCATION = "\n…（报告内容已截断）…\n"
 
 
 @dataclass
@@ -45,6 +55,7 @@ class ActiveTurn:
     thread_id: str
     event: AstrMessageEvent
     completed: asyncio.Future
+    request_text: str = ""
     message_deltas: dict[str, list[str]] = field(default_factory=dict)
     unassigned_deltas: list[str] = field(default_factory=list)
     sent_message_ids: set[str] = field(default_factory=set)
@@ -57,7 +68,11 @@ class ActiveTurn:
     interrupt_requested: bool = False
     success_message: str | None = None
     task: asyncio.Task | None = None
-    activity_events: list[dict[str, Any]] = field(default_factory=list)
+    activity_events: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=_REPORT_EVENT_LIMIT)
+    )
+    activity_truncated: bool = False
+    had_reportable_activity: bool = False
     active_items: dict[str, str] = field(default_factory=dict)
     current_activity: str = "等待 Codex 开始"
     started_at: float = field(default_factory=monotonic)
@@ -82,6 +97,7 @@ class CodexPlugin(Star):
         {
             "thread/status/changed",
             "thread/tokenUsage/updated",
+            "turn/diff/updated",
             "turn/started",
             "turn/completed",
         }
@@ -169,7 +185,10 @@ class CodexPlugin(Star):
     async def terminate(self) -> None:
         """Leave continuous chat, stop pending work, and close Codex."""
         self._stopping = True
-        if any(binding.enabled for binding in self.bindings.values()):
+        connected_sessions = [
+            binding.umo for binding in self.bindings.values() if binding.enabled
+        ]
+        if connected_sessions:
             for binding in self.bindings.values():
                 binding.enabled = False
             try:
@@ -193,6 +212,21 @@ class CodexPlugin(Star):
         if self.client:
             await self.client.close()
             self.client = None
+        for umo in connected_sessions:
+            try:
+                delivered = await self.context.send_message(
+                    umo,
+                    MessageChain().message(
+                        "Codex 插件已关闭，当前聊天已断开连接。"
+                        "插件重新启用后，发送 /codex 可重新连接。"
+                    ),
+                )
+                if not delivered:
+                    self.logger.warning(
+                        "无法通知 Codex 会话已断开，未找到平台：%s", umo
+                    )
+            except Exception as exc:
+                self.logger.warning("无法通知 Codex 会话已断开（%s）：%s", umo, exc)
 
     def _save_bindings(self) -> None:
         """Write bindings atomically so a restart cannot leave partial JSON."""
@@ -490,7 +524,11 @@ class CodexPlugin(Star):
                     else "无运行中的任务"
                 )
                 activity_count = (
-                    len(self._activity_groups(state.activity_events)) if state else 0
+                    f"{len(self._activity_groups(state.activity_events))} 项"
+                    if state and self.send_final_report
+                    else "未收集（报告已关闭）"
+                    if state
+                    else "0 项"
                 )
                 work_time = (
                     self._elapsed_text(state.started_at)
@@ -502,7 +540,7 @@ class CodexPlugin(Star):
                     f"任务：{'运行中' if running else '空闲'}\n"
                     f"本轮工作时间：{work_time}\n"
                     f"当前活动：{activity}\n"
-                    f"活动记录：{activity_count} 项\n"
+                    f"活动记录：{activity_count}\n"
                     f"模型：{self._model_description(binding)}\n"
                     f"工作目录：{binding.cwd}\n线程：{binding.thread_id}"
                 )
@@ -605,25 +643,6 @@ class CodexPlugin(Star):
                             f"当前线程的思考等级已设为 "
                             f"{self._model_description(binding)}。"
                         )
-            elif action == "summary":
-                binding = await self._require_binding(event)
-                requested_summary = argument.lower().strip()
-                choices = {"none", "auto", "concise", "detailed"}
-                if requested_summary not in choices:
-                    raise CodexAppServerError(
-                        "summary 用法：/codex summary <none|auto|concise|detailed>。"
-                    )
-                async with binding.lock:
-                    self._ensure_idle(binding)
-                    client = await self._ensure_client()
-                    await client.request(
-                        "thread/settings/update",
-                        {
-                            "threadId": binding.thread_id,
-                            "summary": requested_summary,
-                        },
-                    )
-                result = f"当前线程的推理摘要级别已设为 {requested_summary}。"
             elif action == "compact":
                 binding = await self._require_binding(event)
                 async with binding.lock:
@@ -653,7 +672,7 @@ class CodexPlugin(Star):
             else:
                 result = (
                     f"暂不支持 Codex 命令 /{action}。可用命令："
-                    "help、exit、close、yes、no、stop、status、pwd、new、compact、review、model、effort、summary。"
+                    "help、exit、close、yes、no、stop、status、pwd、new、compact、review、model、effort。"
                     "要把斜杠文本作为普通任务，请在消息开头加 //。"
                 )
         except (CodexAppServerError, OSError, ValueError) as exc:
@@ -739,12 +758,30 @@ class CodexPlugin(Star):
         *,
         success_message: str | None = None,
     ) -> ActiveTurn:
+        request_text = ""
+        request_truncated = False
+        if self.send_final_report:
+            request_text = event.get_message_str().strip()
+            inputs = params.get("input")
+            if isinstance(inputs, list):
+                texts = [
+                    item["text"]
+                    for item in inputs
+                    if isinstance(item, dict) and isinstance(item.get("text"), str)
+                ]
+                if texts:
+                    request_text = "\n".join(texts).strip()
+            request_text, request_truncated = self._clip_report_text(
+                request_text, 4_000
+            )
         state = ActiveTurn(
             binding=binding,
             thread_id=binding.thread_id,
             event=event,
             completed=asyncio.get_running_loop().create_future(),
+            request_text=request_text,
             success_message=success_message,
+            activity_truncated=request_truncated,
         )
         self.active_turns[binding.thread_id] = state
         task = self._track_task(self._run_turn(binding, state, method, params))
@@ -922,15 +959,82 @@ class CodexPlugin(Star):
             return "Codex 任务状态：" + method.removeprefix("turn/")
         return method
 
+    @staticmethod
+    def _clip_report_text(value: str, limit: int) -> tuple[str, bool]:
+        if len(value) <= limit:
+            return value, False
+        if limit <= len(_REPORT_TRUNCATION):
+            return _REPORT_TRUNCATION.strip(), True
+        available = limit - len(_REPORT_TRUNCATION)
+        head = available // 4
+        tail = available - head
+        return value[:head] + _REPORT_TRUNCATION + value[-tail:], True
+
+    @classmethod
+    def _activity_snapshot(cls, params: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        remaining_text = _REPORT_EVENT_TEXT_LIMIT
+        remaining_nodes = _REPORT_NODE_LIMIT
+        truncated = False
+
+        def copy(value: Any, depth: int = 0) -> Any:
+            nonlocal remaining_text, remaining_nodes, truncated
+            if depth >= 16 or remaining_nodes <= 0:
+                truncated = True
+                return _REPORT_TRUNCATION.strip()
+            remaining_nodes -= 1
+            if isinstance(value, str):
+                limit = min(_REPORT_FIELD_TEXT_LIMIT, remaining_text)
+                result, clipped = cls._clip_report_text(value, limit)
+                remaining_text -= min(len(value), limit)
+                truncated |= clipped
+                return result
+            if isinstance(value, dict):
+                result = {}
+                for index, (key, item) in enumerate(value.items()):
+                    if index >= _REPORT_CONTAINER_LIMIT or remaining_nodes <= 0:
+                        truncated = True
+                        result["…"] = _REPORT_TRUNCATION.strip()
+                        break
+                    result[str(key)] = copy(item, depth + 1)
+                return result
+            if isinstance(value, (list, tuple)):
+                result = []
+                for index, item in enumerate(value):
+                    if index >= _REPORT_CONTAINER_LIMIT or remaining_nodes <= 0:
+                        truncated = True
+                        result.append(_REPORT_TRUNCATION.strip())
+                        break
+                    result.append(copy(item, depth + 1))
+                return result
+            if value is None or isinstance(value, (bool, int, float)):
+                return value
+            return copy(str(value), depth + 1)
+
+        return copy(params), truncated
+
     def _record_activity(
         self, state: ActiveTurn, method: str, params: dict[str, Any]
     ) -> None:
-        if method in self._HIDDEN_ACTIVITY_METHODS:
+        if not self.send_final_report or method in self._HIDDEN_ACTIVITY_METHODS:
             return
         raw_item = params.get("item")
         if isinstance(raw_item, dict) and raw_item.get("type") == "userMessage":
             return
-        snapshot = json.loads(json.dumps(params, ensure_ascii=False, default=str))
+        if method.startswith(
+            (
+                "serverRequest/",
+                "item/commandExecution/",
+                "item/fileChange/",
+                "item/mcpToolCall/",
+                "item/plan/",
+            )
+        ) or (
+            isinstance(raw_item, dict)
+            and raw_item.get("type") not in {"userMessage", "agentMessage", "reasoning"}
+        ):
+            state.had_reportable_activity = True
+        snapshot, truncated = self._activity_snapshot(params)
+        state.activity_truncated |= truncated
         item = snapshot.get("item")
         item_id = (
             item.get("id")
@@ -944,9 +1048,11 @@ class CodexPlugin(Star):
                 previous_params = previous.get("params")
                 if isinstance(previous_params, dict):
                     if isinstance(snapshot.get("delta"), str):
-                        previous_params["delta"] = (
-                            str(previous_params.get("delta") or "") + snapshot["delta"]
+                        previous_params["delta"], truncated = self._clip_report_text(
+                            str(previous_params.get("delta") or "") + snapshot["delta"],
+                            _REPORT_FIELD_TEXT_LIMIT,
                         )
+                        state.activity_truncated |= truncated
                     elif isinstance(snapshot.get("message"), str):
                         previous_params["message"] = snapshot["message"]
                     else:
@@ -963,6 +1069,8 @@ class CodexPlugin(Star):
             "params": snapshot,
             "update_count": 1,
         }
+        if len(state.activity_events) == _REPORT_EVENT_LIMIT:
+            state.activity_truncated = True
         state.activity_events.append(event)
 
     @staticmethod
@@ -1087,7 +1195,7 @@ class CodexPlugin(Star):
         return preview
 
     @classmethod
-    def _activity_groups(cls, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _activity_groups(cls, events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         groups: dict[str, dict[str, Any]] = {}
         for event in events:
             item_id = event.get("item_id")
@@ -1296,28 +1404,57 @@ class CodexPlugin(Star):
                 status = "失败"
         elif kind == "fileChange":
             changes = item.get("changes")
-            if isinstance(changes, list):
-                result = "\n".join(
-                    " ".join(
-                        part
-                        for part in (
-                            {
-                                "add": "新增",
-                                "update": "修改",
-                                "delete": "删除",
-                                "move": "移动",
-                            }.get(change.get("kind"), str(change.get("kind") or "")),
-                            str(change.get("path") or ""),
-                        )
-                        if part
-                    )
-                    if isinstance(change, dict)
-                    else str(change)
-                    for change in changes
+            if not isinstance(changes, list) or not any(
+                isinstance(change, dict) and change.get("diff") for change in changes
+            ):
+                changes = next(
+                    (
+                        event.get("params", {}).get("changes")
+                        for event in reversed(events)
+                        if event.get("method") == "item/fileChange/patchUpdated"
+                    ),
+                    changes,
                 )
-            output = cls._activity_preview(events, limit=None)
-            if output:
-                result = f"{result}\n{output}".strip()
+            if isinstance(changes, list):
+                lines = []
+                for change in changes:
+                    if not isinstance(change, dict):
+                        lines.append(str(change))
+                        continue
+                    change_kind = change.get("kind")
+                    if isinstance(change_kind, dict):
+                        change_kind = change_kind.get("type")
+                    change_kind = (
+                        change_kind
+                        if isinstance(change_kind, str)
+                        else str(change_kind or "")
+                    )
+                    label = {
+                        "add": "新增",
+                        "update": "修改",
+                        "delete": "删除",
+                        "move": "移动",
+                    }.get(change_kind, change_kind)
+                    lines.append(
+                        " ".join(
+                            part
+                            for part in (label, str(change.get("path") or ""))
+                            if part
+                        )
+                    )
+                    diff = change.get("diff")
+                    if isinstance(diff, str) and diff.strip():
+                        lines.append(diff.strip())
+                result = "\n".join(lines)
+            if not result or not any(
+                isinstance(change, dict)
+                and isinstance(change.get("diff"), str)
+                and change["diff"].strip()
+                for change in changes or []
+            ):
+                output = cls._activity_preview(events, limit=None)
+                if output:
+                    result = f"{result}\n{output}".strip()
         elif kind == "agentMessage":
             result = cls._agent_message_text(events)
         else:
@@ -1337,39 +1474,38 @@ class CodexPlugin(Star):
         return status.strip(), result.strip(), highlight.strip()
 
     @staticmethod
-    def _result_excerpt(value: str, limit: int = 1200) -> str:
+    def _result_excerpt(value: str, limit: int = _REPORT_RESULT_PREVIEW_LIMIT) -> str:
         if len(value) <= limit:
             return value
         head = value[:200].rstrip()
-        tail = value[-(limit - 240) :].lstrip()
+        tail = value[-200:].lstrip()
         return f"{head}\n…（中间内容已折叠）…\n{tail}"
 
     @staticmethod
+    def _display_command(command: str) -> str:
+        value = command.strip()
+        if not value.startswith('"'):
+            return command
+        end = value.find('"', 1)
+        if end < 0:
+            return command
+        executable = value[1:end]
+        if PureWindowsPath(executable).name.lower() not in {
+            "pwsh.exe",
+            "powershell.exe",
+        }:
+            return command
+        flag, separator, script = value[end + 1 :].strip().partition(" ")
+        if flag.lower() != "-command" or not separator or not script.strip():
+            return command
+        script = script.strip()
+        if len(script) >= 2 and script[0] in "'\"" and script[-1] == script[0]:
+            script = script[1:-1]
+        return script
+
+    @staticmethod
     def _should_send_final_report(state: ActiveTurn, *, status: str) -> bool:
-        if status != "已完成":
-            return True
-        for event in state.activity_events:
-            method = event.get("method", "")
-            if method.startswith("serverRequest/"):
-                return True
-            if method.startswith(
-                (
-                    "item/commandExecution/",
-                    "item/fileChange/",
-                    "item/mcpToolCall/",
-                    "item/plan/",
-                )
-            ):
-                return True
-            params = event.get("params")
-            item = params.get("item") if isinstance(params, dict) else None
-            if isinstance(item, dict) and item.get("type") not in {
-                "userMessage",
-                "agentMessage",
-                "reasoning",
-            }:
-                return True
-        return False
+        return status != "已完成" or state.had_reportable_activity
 
     def _activity_report_html(
         self,
@@ -1418,7 +1554,7 @@ class CodexPlugin(Star):
                 if isinstance(command, str) and command.strip():
                     command_block = (
                         "<div class='command'><span class='field-label'>命令</span>"
-                        f"<code>{html.escape(command)}</code></div>"
+                        f"<code>{html.escape(self._display_command(command))}</code></div>"
                     )
             if kind == "agentMessage":
                 status_text, result_text, highlight = (
@@ -1445,7 +1581,7 @@ class CodexPlugin(Star):
             )
             preview = (
                 highlight
-                if highlight and len(result_text) > 1200
+                if highlight and len(result_text) > _REPORT_RESULT_PREVIEW_LIMIT
                 else self._result_excerpt(result_text)
             )
             label_block = (
@@ -1463,7 +1599,7 @@ class CodexPlugin(Star):
             detail_block = (
                 "<details class='result-detail'><summary>查看完整结果</summary>"
                 f"<pre>{html.escape(result_text)}</pre></details>"
-                if result_text and len(result_text) > 1200
+                if result_text and len(result_text) > _REPORT_RESULT_PREVIEW_LIMIT
                 else ""
             )
             cards.append(
@@ -1475,6 +1611,12 @@ class CodexPlugin(Star):
         if not cards:
             cards.append("<div class='empty'>暂无可展示的活动</div>")
 
+        request_block = (
+            "<section><h2>用户指令</h2>"
+            f"<div class='request-text'>{html.escape(state.request_text)}</div></section>"
+            if state.request_text
+            else ""
+        )
         error_block = f"<p class='error'>{html.escape(error)}</p>" if error else ""
         outcome_style = (
             "outcome-interrupted"
@@ -1487,10 +1629,12 @@ class CodexPlugin(Star):
         note = (
             f"概览只显示最近 24 项；另有 {hidden_count} 项收录在完整记录中。"
             if hidden_count and not full
-            else "较长的结果可展开查看全文。"
+            else "较长的结果可展开查看保留的内容。"
             if full
             else ""
         )
+        if state.activity_truncated:
+            note += " 较早活动或过长内容已截断。"
         return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><style>
 * {{ box-sizing: border-box; }}
@@ -1503,6 +1647,7 @@ h1 {{ margin: 0 0 12px; font-size: 23px; }}
 .meta {{ display: flex; flex-wrap: wrap; gap: 8px 22px; color: #53616c; }}
 section {{ margin-top: 14px; padding: 18px 22px; background: #fff; border: 1px solid #d9e0e5; }}
 h2 {{ margin: 0 0 12px; font-size: 17px; }}
+.request-text {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
 .activity {{ --accent: #82909b; --soft: #f8fafb; margin-top: 10px; padding: 14px 16px; border: 1px solid #e0e7eb; border-left: 4px solid var(--accent); border-radius: 8px; background: var(--soft); overflow-wrap: anywhere; }}
 .kind-reply {{ --accent: #19896e; --soft: #f1faf7; }}
 .kind-command {{ --accent: #5279b9; --soft: #f5f8fe; }}
@@ -1538,7 +1683,7 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
 <span>模型：{html.escape(self._model_description(state.binding))}</span>
 <span>活动：{len(groups)} 项</span>
 </div>{error_block}</header>
-<section><h2>活动记录</h2>{''.join(cards)}<p class="note">{html.escape(note)}</p></section>
+{request_block}<section><h2>活动记录</h2>{''.join(cards)}<p class="note">{html.escape(note)}</p></section>
 </main></body></html>"""
 
     async def _send_final_activity_report(
@@ -1573,7 +1718,10 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
                 )
             )
         except Exception as exc:
-            self.logger.warning("无法发送 Codex HTML 执行记录：%s", exc)
+            self.logger.exception("无法发送 Codex HTML 执行记录：%s", exc)
+            await self._send_codex_reply(
+                state.event, "执行记录生成或发送失败，请查看 AstrBot 日志。"
+            )
 
     async def _interrupt(self, binding: CodexBinding, state: ActiveTurn) -> bool:
         if state.interrupt_requested:
@@ -1754,7 +1902,6 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
             "/codex review [uncommitted|base <分支>|commit <SHA>]：代码审查\n"
             "/codex model [模型ID [思考等级]]：列出或切换模型\n"
             "/codex effort [思考等级]：查看或切换当前模型的思考等级\n"
-            "/codex summary <none|auto|concise|detailed>：切换推理摘要级别\n"
             "/codex yes、/codex no：处理审批\n"
             "普通斜杠文本前加 // 可作为 Codex 任务发送。"
         )
