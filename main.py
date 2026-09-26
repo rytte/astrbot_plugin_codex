@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import File, Image, Plain
+from astrbot.api.message_components import File, Plain
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.star.filter.command import GreedyStr
@@ -44,7 +44,12 @@ class ActiveTurn:
     thread_id: str
     event: AstrMessageEvent
     completed: asyncio.Future
-    fragments: list[str] = field(default_factory=list)
+    message_deltas: dict[str, list[str]] = field(default_factory=dict)
+    unassigned_deltas: list[str] = field(default_factory=list)
+    sent_message_ids: set[str] = field(default_factory=set)
+    sent_message_texts: set[str] = field(default_factory=set)
+    reply_sent: bool = False
+    delivery_task: asyncio.Task | None = None
     turn_id: str | None = None
     turn_started: asyncio.Event = field(default_factory=asyncio.Event)
     suppress_reply: bool = False
@@ -55,9 +60,6 @@ class ActiveTurn:
     active_items: dict[str, str] = field(default_factory=dict)
     current_activity: str = "等待 Codex 开始"
     started_at: float = field(default_factory=monotonic)
-    report_task: asyncio.Task | None = None
-    report_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    report_error_notified: bool = False
 
 
 @dataclass
@@ -74,6 +76,25 @@ class PendingApproval:
 
 class CodexPlugin(Star):
     """Expose Codex app-server threads as continuous private-chat sessions."""
+
+    _HIDDEN_ACTIVITY_METHODS = frozenset(
+        {
+            "thread/status/changed",
+            "thread/tokenUsage/updated",
+            "turn/started",
+            "turn/completed",
+        }
+    )
+    _COALESCED_ACTIVITY_METHODS = frozenset(
+        {
+            "item/agentMessage/delta",
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+            "item/mcpToolCall/progress",
+            "item/plan/delta",
+            "item/reasoning/summaryTextDelta",
+        }
+    )
 
     def __init__(self, context: Context, config: AstrBotConfig | dict | None = None):
         super().__init__(context)
@@ -442,12 +463,20 @@ class CodexPlugin(Star):
                     if state
                     else "无运行中的任务"
                 )
-                event_count = len(state.activity_events) if state else 0
+                activity_count = (
+                    len(self._activity_groups(state.activity_events)) if state else 0
+                )
+                work_time = (
+                    self._elapsed_text(state.started_at)
+                    if running and state
+                    else "当前无运行中的任务"
+                )
                 result = (
                     f"模式：{'连续对话' if binding.enabled else '已切出'}\n"
                     f"任务：{'运行中' if running else '空闲'}\n"
+                    f"本轮工作时间：{work_time}\n"
                     f"当前活动：{activity}\n"
-                    f"中间事件：{event_count} 条\n"
+                    f"活动记录：{activity_count} 项\n"
                     f"模型：{self._model_description(binding)}\n"
                     f"工作目录：{binding.cwd}\n线程：{binding.thread_id}"
                 )
@@ -665,6 +694,11 @@ class CodexPlugin(Star):
     def _text_input(text: str) -> dict[str, Any]:
         return {"type": "text", "text": text, "textElements": []}
 
+    @staticmethod
+    def _elapsed_text(started_at: float) -> str:
+        elapsed = max(0, int(monotonic() - started_at))
+        return f"{elapsed // 60} 分 {elapsed % 60} 秒"
+
     def _ensure_idle(self, binding: CodexBinding) -> None:
         state = self.active_turns.get(binding.thread_id)
         if state and not state.completed.done():
@@ -689,7 +723,6 @@ class CodexPlugin(Star):
         self.active_turns[binding.thread_id] = state
         task = self._track_task(self._run_turn(binding, state, method, params))
         state.task = task
-        state.report_task = self._track_task(self._periodic_activity_reports(state))
         return state
 
     def _track_task(self, coroutine) -> asyncio.Task:
@@ -724,82 +757,97 @@ class CodexPlugin(Star):
             outcome = await state.completed
             if state.suppress_reply:
                 return
-            message = "".join(state.fragments).strip()
+            if state.delivery_task:
+                await asyncio.gather(state.delivery_task, return_exceptions=True)
+            for reply in self._remaining_reply_texts(state, outcome):
+                await self._send_codex_reply(state.event, reply)
+                state.reply_sent = True
             status = outcome.get("status") if isinstance(outcome, dict) else None
             error = outcome.get("error") if isinstance(outcome, dict) else None
-            if not message:
-                message = self._final_text(outcome)
+            terminal_message = None
             if error:
                 error_text = (
                     error.get("message") if isinstance(error, dict) else str(error)
                 )
-                message = f"Codex 任务失败：{error_text}"
+                terminal_message = f"Codex 任务失败：{error_text}"
                 report_status = "失败"
-            elif status == "completed" and state.success_message:
-                message = state.success_message
-                report_status = "已完成"
-            elif status == "interrupted" and not message:
-                message = "Codex 任务已中断。"
+            elif status == "interrupted":
+                terminal_message = "Codex 任务已中断。"
                 report_status = "已中断"
-            elif status == "failed" and not message:
-                message = "Codex 任务失败，请查看 AstrBot 日志。"
+            elif status == "failed":
+                terminal_message = "Codex 任务失败，请查看 AstrBot 日志。"
                 report_status = "失败"
             else:
                 report_status = "已完成" if status == "completed" else "已结束"
-            if not message:
-                message = "Codex 已完成任务，但没有返回文本。"
+                if state.success_message:
+                    terminal_message = state.success_message
+                elif not state.reply_sent:
+                    terminal_message = "Codex 已完成任务，但没有返回文本。"
+            if terminal_message:
+                await self._send_codex_reply(state.event, terminal_message)
             state.current_activity = report_status
-            await self._send_activity_report(
-                state, status=report_status, final=True
-            )
-            await self._send_codex_reply(state.event, message)
+            if self._should_send_final_report(state, status=report_status):
+                await self._send_final_activity_report(state, status=report_status)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if not state.suppress_reply:
                 state.current_activity = "失败"
-                await self._send_activity_report(
-                    state, status="失败", error=str(exc), final=True
-                )
                 await self._send_codex_reply(state.event, f"Codex 任务失败：{exc}")
+                await self._send_final_activity_report(
+                    state, status="失败", error=str(exc)
+                )
         finally:
-            if state.report_task and not state.report_task.done():
-                state.report_task.cancel()
-                await asyncio.gather(state.report_task, return_exceptions=True)
             if self.active_turns.get(state.thread_id) is state:
                 self.active_turns.pop(state.thread_id, None)
 
-    async def _periodic_activity_reports(self, state: ActiveTurn) -> None:
-        while not state.completed.done() and not state.suppress_reply:
-            try:
-                await asyncio.wait_for(asyncio.shield(state.completed), timeout=60)
-            except asyncio.TimeoutError:
-                if state.completed.done() or state.suppress_reply:
-                    return
-                status = (
-                    "等待审批"
-                    if any(
-                        approval.umo == state.binding.umo
-                        for approval in self.pending_approvals.values()
-                    )
-                    else "工作中"
-                )
-                await self._send_activity_report(state, status=status)
-            else:
-                return
+    def _queue_codex_reply(self, state: ActiveTurn, message: str) -> None:
+        if state.suppress_reply or not message.strip():
+            return
+        previous = state.delivery_task
 
-    def _get_browser_service(self):
-        metadata = self.context.get_registered_star("astrbot_plugin_browser")
-        if (
-            metadata is None
-            or not metadata.activated
-            or metadata.star_cls is None
-        ):
-            raise CodexAppServerError("请先启用 astrbot_plugin_browser 插件。")
-        service = metadata.star_cls.service
-        if not service.ready:
-            raise CodexAppServerError("astrbot_plugin_browser 服务尚未就绪。")
-        return service
+        async def deliver() -> None:
+            if previous:
+                await asyncio.gather(previous, return_exceptions=True)
+            if not state.suppress_reply:
+                await self._send_codex_reply(state.event, message)
+
+        state.delivery_task = self._track_task(deliver())
+        state.reply_sent = True
+        state.sent_message_texts.add(message)
+
+    @staticmethod
+    def _remaining_reply_texts(state: ActiveTurn, outcome: Any) -> list[str]:
+        replies: list[str] = []
+        turn = outcome.get("turn", outcome) if isinstance(outcome, dict) else {}
+        items = turn.get("items") if isinstance(turn, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                    continue
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id in state.sent_message_ids:
+                    state.message_deltas.pop(item_id, None)
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    if (
+                        not isinstance(item_id, str)
+                        and text in state.sent_message_texts
+                    ):
+                        continue
+                    replies.append(text)
+                    if isinstance(item_id, str):
+                        state.message_deltas.pop(item_id, None)
+        for item_id, deltas in state.message_deltas.items():
+            if item_id not in state.sent_message_ids:
+                text = "".join(deltas)
+                if text.strip():
+                    replies.append(text)
+        unassigned = "".join(state.unassigned_deltas)
+        if unassigned.strip() and unassigned not in state.sent_message_texts:
+            replies.append(unassigned)
+        return replies
 
     @staticmethod
     def _activity_title(method: str, params: dict[str, Any]) -> str:
@@ -814,7 +862,7 @@ class CodexPlugin(Star):
             if kind == "fileChange":
                 return f"文件变更：{len(item.get('changes', []))} 项"
             if kind == "agentMessage":
-                return "生成 Codex 回复"
+                return "Codex 回复"
             if kind == "reasoning":
                 return "推理摘要"
             if kind == "plan":
@@ -838,7 +886,7 @@ class CodexPlugin(Star):
                 return "审批结果：" + decision
             return "权限审批：" + request_method
         if method == "item/agentMessage/delta":
-            return "生成回复内容"
+            return "Codex 回复"
         if method.startswith("item/reasoning/"):
             return "推理摘要更新"
         if method.startswith("turn/"):
@@ -848,6 +896,11 @@ class CodexPlugin(Star):
     def _record_activity(
         self, state: ActiveTurn, method: str, params: dict[str, Any]
     ) -> None:
+        if method in self._HIDDEN_ACTIVITY_METHODS:
+            return
+        raw_item = params.get("item")
+        if isinstance(raw_item, dict) and raw_item.get("type") == "userMessage":
+            return
         snapshot = json.loads(json.dumps(params, ensure_ascii=False, default=str))
         item = snapshot.get("item")
         item_id = (
@@ -855,13 +908,31 @@ class CodexPlugin(Star):
             if isinstance(item, dict) and isinstance(item.get("id"), str)
             else snapshot.get("itemId")
         )
+        item_id = item_id if isinstance(item_id, str) else None
+        if method in self._COALESCED_ACTIVITY_METHODS and state.activity_events:
+            previous = state.activity_events[-1]
+            if previous.get("method") == method and previous.get("item_id") == item_id:
+                previous_params = previous.get("params")
+                if isinstance(previous_params, dict):
+                    if isinstance(snapshot.get("delta"), str):
+                        previous_params["delta"] = (
+                            str(previous_params.get("delta") or "") + snapshot["delta"]
+                        )
+                    elif isinstance(snapshot.get("message"), str):
+                        previous_params["message"] = snapshot["message"]
+                    else:
+                        previous_params.update(snapshot)
+                    previous["update_count"] = previous.get("update_count", 1) + 1
+                    previous["time"] = datetime.now().astimezone().strftime("%H:%M:%S")
+                    return
         event = {
             "sequence": len(state.activity_events) + 1,
             "time": datetime.now().astimezone().strftime("%H:%M:%S"),
             "method": method,
-            "item_id": item_id if isinstance(item_id, str) else None,
+            "item_id": item_id,
             "title": self._activity_title(method, snapshot),
             "params": snapshot,
+            "update_count": 1,
         }
         state.activity_events.append(event)
 
@@ -878,7 +949,18 @@ class CodexPlugin(Star):
     def _activity_for_item(
         self, state: ActiveTurn, method: str, params: dict[str, Any]
     ) -> None:
+        if method in self._HIDDEN_ACTIVITY_METHODS and method not in {
+            "turn/started",
+            "turn/completed",
+        }:
+            return
         item = params.get("item")
+        if isinstance(item, dict) and item.get("type") == "userMessage":
+            return
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            if method == "item/completed":
+                state.current_activity = "等待 Codex 继续工作"
+            return
         item_id = None
         if isinstance(item, dict) and isinstance(item.get("id"), str):
             item_id = item["id"]
@@ -904,7 +986,28 @@ class CodexPlugin(Star):
             state.current_activity = self._activity_title(method, params)
 
     @staticmethod
-    def _activity_preview(events: list[dict[str, Any]], limit: int = 420) -> str:
+    def _agent_message_text(events: list[dict[str, Any]]) -> str:
+        completed_text = ""
+        deltas = []
+        for event in events:
+            params = event.get("params")
+            if not isinstance(params, dict):
+                continue
+            if event.get("method") == "item/agentMessage/delta":
+                delta = params.get("delta")
+                if isinstance(delta, str):
+                    deltas.append(delta)
+            elif event.get("method") == "item/completed":
+                item = params.get("item")
+                if isinstance(item, dict) and item.get("type") == "agentMessage":
+                    value = item.get("text")
+                    if isinstance(value, str) and value.strip():
+                        completed_text = value
+        text = completed_text or "".join(deltas)
+        return text if text.strip() else ""
+
+    @staticmethod
+    def _activity_preview(events: list[dict[str, Any]], limit: int | None = 420) -> str:
         """Extract human-readable streaming text without replacing raw events."""
         chunks: list[str] = []
         seen: set[str] = set()
@@ -950,12 +1053,12 @@ class CodexPlugin(Star):
             seen.add(text)
             chunks.append(text)
         preview = "\n".join(chunks)
-        if len(preview) > limit:
+        if limit is not None and len(preview) > limit:
             return preview[: max(0, limit - 1)].rstrip() + "…"
         return preview
 
-    @staticmethod
-    def _activity_groups(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    @classmethod
+    def _activity_groups(cls, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         groups: dict[str, dict[str, Any]] = {}
         for event in events:
             item_id = event.get("item_id")
@@ -967,13 +1070,61 @@ class CodexPlugin(Star):
                     "first_time": event.get("time", ""),
                     "last_time": event.get("time", ""),
                     "events": [],
+                    "kind": None,
                 }
                 groups[key] = group
             elif event["method"] in {"item/started", "item/completed"}:
                 group["title"] = event.get("title", group["title"])
+            params = event.get("params")
+            item = params.get("item") if isinstance(params, dict) else None
+            if isinstance(item, dict) and isinstance(item.get("type"), str):
+                group["kind"] = item["type"]
+            elif group["kind"] is None:
+                if event["method"].startswith("item/reasoning/"):
+                    group["kind"] = "reasoning"
+                elif event["method"].startswith("item/agentMessage/"):
+                    group["kind"] = "agentMessage"
             group["last_time"] = event.get("time", group["last_time"])
             group["events"].append(event)
-        return list(groups.values())
+        visible = []
+        for group in groups.values():
+            if group["kind"] == "reasoning" and not cls._activity_preview(
+                group["events"], limit=None
+            ):
+                continue
+            if group["kind"] == "agentMessage" and not cls._agent_message_text(
+                group["events"]
+            ):
+                continue
+            visible.append(group)
+        return visible
+
+    @staticmethod
+    def _should_send_final_report(state: ActiveTurn, *, status: str) -> bool:
+        if status != "已完成":
+            return True
+        for event in state.activity_events:
+            method = event.get("method", "")
+            if method.startswith("serverRequest/"):
+                return True
+            if method.startswith(
+                (
+                    "item/commandExecution/",
+                    "item/fileChange/",
+                    "item/mcpToolCall/",
+                    "item/plan/",
+                )
+            ):
+                return True
+            params = event.get("params")
+            item = params.get("item") if isinstance(params, dict) else None
+            if isinstance(item, dict) and item.get("type") not in {
+                "userMessage",
+                "agentMessage",
+                "reasoning",
+            }:
+                return True
+        return False
 
     def _activity_report_html(
         self,
@@ -985,36 +1136,35 @@ class CodexPlugin(Star):
     ) -> str:
         groups = self._activity_groups(state.activity_events)
         visible_groups = groups if full else groups[-24:]
-        elapsed = max(0, int(monotonic() - state.started_at))
         current = state.current_activity
         if state.active_items:
             current = list(state.active_items.values())[-1]
 
         cards = []
         for group in visible_groups:
-            serialized = json.dumps(group["events"], ensure_ascii=False, indent=2)
-            line_count = len(serialized.splitlines())
             title = html.escape(str(group["title"]))
-            preview = html.escape(self._activity_preview(group["events"]))
-            preview_block = (
-                f"<div class='preview'>{preview}</div>" if preview else ""
-            )
-            if not preview and "推理摘要" in str(group["title"]):
-                preview_block = (
-                    "<div class='preview muted'>"
-                    "未收到摘要文本；原始事件仍已记录"
-                    "</div>"
-                )
             time_label = html.escape(
                 str(group["first_time"])
                 if group["first_time"] == group["last_time"]
                 else f"{group['first_time']} - {group['last_time']}"
             )
-            count = len(group["events"])
+            if group["kind"] == "agentMessage":
+                reply = self._agent_message_text(group["events"])
+                if not full and len(reply) > 420:
+                    reply = reply[:419].rstrip() + "…"
+                cards.append(
+                    "<div class='activity'><div class='activity-body'><div><span>"
+                    f"{title}</span><small>{time_label}</small></div>"
+                    f"<div class='preview'>{html.escape(reply)}</div></div></div>"
+                )
+                continue
+            serialized = json.dumps(group["events"], ensure_ascii=False, indent=2)
+            preview = html.escape(self._activity_preview(group["events"]))
+            preview_block = f"<div class='preview'>{preview}</div>" if preview else ""
             if full:
                 cards.append(
                     "<details class='activity'><summary>"
-                    f"<span>{title}</span><small>{time_label} · {count} 条 · 原始 +{line_count} 行</small>"
+                    f"<span>{title}</span><small>{time_label}</small>"
                     f"</summary>{preview_block}<pre>"
                     f"{html.escape(serialized)}"
                     "</pre></details>"
@@ -1022,20 +1172,18 @@ class CodexPlugin(Star):
             else:
                 cards.append(
                     "<div class='activity'><div class='activity-body'><div><span>"
-                    f"{title}</span><small>{time_label} · 原始 +{line_count} 行</small></div>"
+                    f"{title}</span><small>{time_label}</small></div>"
                     f"{preview_block}</div></div>"
                 )
         if not cards:
-            cards.append("<div class='empty'>等待 Codex 活动</div>")
+            cards.append("<div class='empty'>暂无可展示的活动</div>")
 
-        error_block = (
-            f"<p class='error'>{html.escape(error)}</p>" if error else ""
-        )
+        error_block = f"<p class='error'>{html.escape(error)}</p>" if error else ""
         hidden_count = max(0, len(groups) - len(visible_groups))
         note = (
             f"概览只显示最近 24 项；另有 {hidden_count} 项收录在完整记录中。"
             if hidden_count and not full
-            else "原始通知按活动折叠，可展开查看完整参数与输出。"
+            else "工具等活动可展开查看参数与输出。"
             if full
             else ""
         )
@@ -1063,104 +1211,46 @@ pre {{ max-height: none; margin: 10px 0 4px; padding: 12px; background: #f4f6f8;
 .error {{ color: #a72e2e; }}
 </style></head><body><main>
 <header><h1>Codex 执行情况</h1><div class="meta">
-<span>状态：{html.escape(status)}</span><span>耗时：{elapsed // 60} 分 {elapsed % 60} 秒</span>
+<span>状态：{html.escape(status)}</span><span>耗时：{self._elapsed_text(state.started_at)}</span>
 <span>模型：{html.escape(self._model_description(state.binding))}</span>
-<span>事件：{len(state.activity_events)}</span>
+<span>活动：{len(groups)} 项</span>
 </div><div class="current">当前活动：{html.escape(current)}</div>{error_block}</header>
 <section><h2>活动记录</h2>{''.join(cards)}<p class="note">{html.escape(note)}</p></section>
 </main></body></html>"""
 
-    async def _send_activity_report(
+    async def _send_final_activity_report(
         self,
         state: ActiveTurn,
         *,
         status: str,
-        final: bool = False,
         error: str | None = None,
     ) -> None:
         if state.suppress_reply:
             return
-        async with state.report_lock:
+        try:
+            report_dir = self.data_dir / "reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_file = report_dir / (
+                f"codex-{state.thread_id[:8]}-{uuid4().hex[:8]}.html"
+            )
+            report_html = self._activity_report_html(
+                state, status=status, full=True, error=error
+            )
+            await asyncio.to_thread(
+                report_file.write_text, report_html, encoding="utf-8"
+            )
             if state.suppress_reply:
                 return
-            report_file: Path | None = None
-            if final:
-                report_dir = self.data_dir / "reports"
-                report_dir.mkdir(parents=True, exist_ok=True)
-                report_file = report_dir / (
-                    f"codex-{state.thread_id[:8]}-{uuid4().hex[:8]}.html"
+            await state.event.send(
+                MessageChain(
+                    chain=[
+                        Plain("[codex] 执行记录（HTML，可展开查看工具详情）"),
+                        File(name=report_file.name, file=str(report_file)),
+                    ]
                 )
-                full_html = self._activity_report_html(
-                    state, status=status, full=True, error=error
-                )
-                await asyncio.to_thread(
-                    report_file.write_text, full_html, encoding="utf-8"
-                )
-
-            try:
-                service = self._get_browser_service()
-                overview_html = self._activity_report_html(
-                    state, status=status, full=False, error=error
-                )
-                png = await service.render_html(
-                    overview_html,
-                    viewport={"width": 1000, "height": 900},
-                    full_page=True,
-                    timeout=30,
-                    max_pixels=8_000_000,
-                )
-                if state.suppress_reply:
-                    return
-                caption = (
-                    f"[codex] 执行情况：{status}，已收集 "
-                    f"{len(state.activity_events)} 条中间事件。"
-                )
-                await state.event.send(
-                    MessageChain(chain=[Plain(caption), Image.fromBytes(png)])
-                )
-            except Exception as exc:
-                self.logger.warning("无法生成 Codex 执行情况图片：%s", exc)
-                if not state.report_error_notified and not final:
-                    state.report_error_notified = True
-                    await self._send_text(
-                        state.event,
-                        f"[codex] 执行情况图片生成失败：{exc}",
-                    )
-
-            if final and report_file and report_file.is_file():
-                try:
-                    await state.event.send(
-                        MessageChain(
-                            chain=[
-                                Plain("[codex] 完整执行记录（HTML，可展开查看）"),
-                                File(
-                                    name=report_file.name,
-                                    file=str(report_file),
-                                ),
-                            ]
-                        )
-                    )
-                except Exception as exc:
-                    self.logger.warning("无法发送 Codex HTML 执行记录：%s", exc)
-
-    @staticmethod
-    def _final_text(outcome: Any) -> str:
-        if not isinstance(outcome, dict):
-            return ""
-        turn = outcome.get("turn")
-        if not isinstance(turn, dict):
-            return ""
-        items = turn.get("items", [])
-        if not isinstance(items, list):
-            return ""
-        messages = [
-            item.get("text", "")
-            for item in items
-            if isinstance(item, dict)
-            and item.get("type") == "agentMessage"
-            and isinstance(item.get("text"), str)
-        ]
-        return "\n".join(messages).strip()
+            )
+        except Exception as exc:
+            self.logger.warning("无法发送 Codex HTML 执行记录：%s", exc)
 
     async def _interrupt(self, binding: CodexBinding, state: ActiveTurn) -> bool:
         if state.interrupt_requested:
@@ -1238,9 +1328,7 @@ pre {{ max-height: none; margin: 10px 0 4px; padding: 12px; background: #f4f6f8;
                     "decision": decision,
                 }
             )
-            self._record_activity(
-                state, "serverRequest/resolved", activity_params
-            )
+            self._record_activity(state, "serverRequest/resolved", activity_params)
             state.active_items.pop(f"approval:{approval.request_id}", None)
             state.current_activity = f"审批{decision}"
         current_task = asyncio.current_task()
@@ -1380,7 +1468,31 @@ pre {{ max-height: none; margin: 10px 0 4px; padding: 12px; background: #f4f6f8;
             if state.turn_id is None or turn_id == state.turn_id:
                 delta = params.get("delta")
                 if isinstance(delta, str):
-                    state.fragments.append(delta)
+                    item_id = params.get("itemId")
+                    if isinstance(item_id, str):
+                        state.message_deltas.setdefault(item_id, []).append(delta)
+                    else:
+                        state.unassigned_deltas.append(delta)
+        elif method == "item/completed":
+            item = params.get("item")
+            if isinstance(item, dict) and item.get("type") == "agentMessage":
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id in state.sent_message_ids:
+                    return
+                completed_text = item.get("text")
+                if not isinstance(completed_text, str) or not completed_text.strip():
+                    completed_text = (
+                        "".join(state.message_deltas.get(item_id, []))
+                        if isinstance(item_id, str)
+                        else "".join(state.unassigned_deltas)
+                    )
+                if completed_text.strip():
+                    if isinstance(item_id, str):
+                        state.sent_message_ids.add(item_id)
+                        state.message_deltas.pop(item_id, None)
+                    else:
+                        state.unassigned_deltas.clear()
+                    self._queue_codex_reply(state, completed_text)
         elif method == "turn/completed":
             turn = params.get("turn", {})
             turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -1433,9 +1545,7 @@ pre {{ max-height: none; margin: 10px 0 4px; padding: 12px; background: #f4f6f8;
             if state:
                 activity_params = dict(params)
                 activity_params["requestId"] = request_id
-                self._record_activity(
-                    state, f"serverRequest/{method}", activity_params
-                )
+                self._record_activity(state, f"serverRequest/{method}", activity_params)
                 state.active_items[f"approval:{request_id}"] = (
                     "等待命令执行审批"
                     if method == "item/commandExecution/requestApproval"
@@ -1481,9 +1591,7 @@ pre {{ max-height: none; margin: 10px 0 4px; padding: 12px; background: #f4f6f8;
             if state:
                 activity_params = dict(params)
                 activity_params["requestId"] = request_id
-                self._record_activity(
-                    state, f"serverRequest/{method}", activity_params
-                )
+                self._record_activity(state, f"serverRequest/{method}", activity_params)
                 state.current_activity = self._activity_title(
                     f"serverRequest/{method}", activity_params
                 )
