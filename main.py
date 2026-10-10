@@ -127,6 +127,7 @@ class CodexPlugin(Star):
             "send_progress_images",
             "send_final_report",
             "allow_group_chat",
+            "reply_prefix_mode",
         }
         if unknown:
             raise ValueError("未知插件配置：" + ", ".join(sorted(unknown)))
@@ -135,6 +136,7 @@ class CodexPlugin(Star):
         self.send_progress_images = settings.get("send_progress_images", False)
         self.send_final_report = settings.get("send_final_report", False)
         self.allow_group_chat = settings.get("allow_group_chat", False)
+        self.reply_prefix_mode = settings.get("reply_prefix_mode", "codex")
         if (
             type(self.approval_timeout) is not int
             or not 30 <= self.approval_timeout <= 900
@@ -146,6 +148,14 @@ class CodexPlugin(Star):
             raise ValueError("send_final_report 必须是布尔值。")
         if type(self.allow_group_chat) is not bool:
             raise ValueError("allow_group_chat 必须是布尔值。")
+        if type(self.reply_prefix_mode) is not str or self.reply_prefix_mode not in {
+            "codex",
+            "model",
+            "none",
+        }:
+            raise ValueError(
+                "reply_prefix_mode 必须是 codex、model 或 none。"
+            )
 
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_codex")
         self.bindings_file = self.data_dir / "bindings.json"
@@ -833,7 +843,7 @@ class CodexPlugin(Star):
             if state.delivery_task:
                 await asyncio.gather(state.delivery_task, return_exceptions=True)
             for reply in self._remaining_reply_texts(state, outcome):
-                await self._send_codex_reply(state.event, reply)
+                await self._send_codex_reply(state.event, reply, state.binding)
                 state.reply_sent = True
             status = outcome.get("status") if isinstance(outcome, dict) else None
             error = outcome.get("error") if isinstance(outcome, dict) else None
@@ -857,7 +867,9 @@ class CodexPlugin(Star):
                 elif not state.reply_sent:
                     terminal_message = "Codex 已完成任务，但没有返回文本。"
             if terminal_message:
-                await self._send_codex_reply(state.event, terminal_message)
+                await self._send_codex_reply(
+                    state.event, terminal_message, state.binding
+                )
             state.current_activity = report_status
             if self.send_final_report and self._should_send_final_report(
                 state, status=report_status
@@ -871,7 +883,9 @@ class CodexPlugin(Star):
                 self._flush_progress_images(state)
                 if state.delivery_task:
                     await asyncio.gather(state.delivery_task, return_exceptions=True)
-                await self._send_codex_reply(state.event, f"Codex 任务失败：{exc}")
+                await self._send_codex_reply(
+                    state.event, f"Codex 任务失败：{exc}", state.binding
+                )
                 if self.send_final_report:
                     await self._send_final_activity_report(
                         state, status="失败", error=str(exc)
@@ -889,7 +903,7 @@ class CodexPlugin(Star):
             if previous:
                 await asyncio.gather(previous, return_exceptions=True)
             if not state.suppress_reply:
-                await self._send_codex_reply(state.event, message)
+                await self._send_codex_reply(state.event, message, state.binding)
 
         state.delivery_task = self._track_task(deliver())
         state.reply_sent = True
@@ -1837,7 +1851,10 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
             await state.event.send(
                 MessageChain(
                     chain=[
-                        Plain("[codex] 执行记录（HTML，可查看工具结果）"),
+                        Plain(
+                            f"{self._codex_prefix(state.binding)}"
+                            "执行记录（HTML，可查看工具结果）"
+                        ),
                         File(name=report_file.name, file=str(report_file)),
                     ]
                 )
@@ -1845,7 +1862,9 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
         except Exception as exc:
             self.logger.exception("无法发送 Codex HTML 执行记录：%s", exc)
             await self._send_codex_reply(
-                state.event, "执行记录生成或发送失败，请查看 AstrBot 日志。"
+                state.event,
+                "执行记录生成或发送失败，请查看 AstrBot 日志。",
+                state.binding,
             )
 
     async def _interrupt(self, binding: CodexBinding, state: ActiveTurn) -> bool:
@@ -2228,5 +2247,14 @@ pre {{ max-height: 640px; overflow: auto; margin: 10px 0 4px; padding: 12px; bac
                 self.logger.warning("Unable to deliver Codex response: %s", exc)
                 return
 
-    async def _send_codex_reply(self, event: AstrMessageEvent, text: str) -> None:
-        await self._send_text(event, f"[codex] {text}")
+    def _codex_prefix(self, binding: CodexBinding) -> str:
+        if self.reply_prefix_mode == "none":
+            return ""
+        if self.reply_prefix_mode == "model":
+            return f"[{binding.model or '未知'}] "
+        return "[codex] "
+
+    async def _send_codex_reply(
+        self, event: AstrMessageEvent, text: str, binding: CodexBinding
+    ) -> None:
+        await self._send_text(event, f"{self._codex_prefix(binding)}{text}")

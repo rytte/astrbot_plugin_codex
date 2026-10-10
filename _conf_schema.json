@@ -28,5 +28,13 @@
     "type": "bool",
     "default": false,
     "hint": "默认关闭；开启后，同一群的 AstrBot 管理员共用 Codex 线程，普通成员的消息不会发送给 Codex。"
+  },
+  "reply_prefix_mode": {
+    "description": "连接状态下的消息前缀",
+    "type": "string",
+    "options": ["codex", "model", "none"],
+    "labels": ["[codex]", "当前模型名", "关闭"],
+    "default": "codex",
+    "hint": "codex：使用 [codex]；model：使用当前线程模型名，例如 [gpt-6.1-sol]；none：不添加前缀。模型信息不可用时显示 [未知]。"
   }
 }
